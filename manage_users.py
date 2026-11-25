@@ -1,9 +1,10 @@
 import argparse
 import getpass
-import sqlite3
 import sys
 
-from security_store import create_bootstrap_admin, database_path, initialize
+import app_config
+import security_store
+from security_store import create_bootstrap_admin, initialize
 
 
 def main():
@@ -18,6 +19,12 @@ def main():
     create_admin.add_argument("display_name")
     args = parser.parse_args()
 
+    if app_config.database_url():
+        parser.error(
+            "For PostgreSQL, create the first Admin through the one-time "
+            "bootstrap_admin Streamlit Secrets."
+        )
+
     initialize()
     password = getpass.getpass("Mật khẩu quản trị (tối thiểu 12 ký tự): ")
     confirmation = getpass.getpass("Nhập lại mật khẩu: ")
@@ -26,11 +33,11 @@ def main():
 
     try:
         create_bootstrap_admin(args.username, args.display_name, password)
-    except (ValueError, sqlite3.IntegrityError) as error:
+    except (ValueError, *security_store.DATABASE_ERRORS) as error:
         parser.error(str(error))
 
     print("Đã tạo quản trị viên.")
-    print("Cơ sở dữ liệu:", database_path())
+    print("Cơ sở dữ liệu:", security_store.database_description())
     return 0
 
 

@@ -10,6 +10,12 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+import psycopg
+from psycopg.conninfo import conninfo_to_dict
+from psycopg.rows import dict_row
+
+import app_config
+
 
 PBKDF2_ITERATIONS = 600_000
 PASSWORD_MIN_LENGTH = 12
@@ -17,6 +23,7 @@ MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 900
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
 _INITIALIZED_PATHS = set()
+DATABASE_ERRORS = (sqlite3.Error, psycopg.Error)
 
 
 def database_path():
@@ -28,16 +35,60 @@ def database_path():
     return Path(root) / "UIExportQuotation" / "quotes.sqlite3"
 
 
+def database_description():
+    return "Supabase PostgreSQL" if app_config.database_url() else str(database_path())
+
+
+class _ConnectionAdapter:
+    def __init__(self, connection, is_postgres=False):
+        self._connection = connection
+        self.is_postgres = is_postgres
+
+    def execute(self, query, parameters=()):
+        if self.is_postgres:
+            query = query.replace("?", "%s").replace(
+                "CURRENT_TIMESTAMP",
+                "TO_CHAR(CURRENT_TIMESTAMP, 'YYYY-MM-DD HH24:MI:SS')",
+            )
+        return self._connection.execute(query, parameters)
+
+    def executescript(self, script):
+        return self._connection.executescript(script)
+
+
 @contextmanager
-def _connection():
-    path = database_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=15)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 15000")
+def _connection(actor_user_id=None):
+    configured_url = app_config.database_url()
+    if configured_url:
+        connection_options = conninfo_to_dict(configured_url)
+        sslmode = connection_options.get("sslmode", "")
+        if sslmode not in ("require", "verify-ca", "verify-full"):
+            sslmode = "require"
+        connection = psycopg.connect(
+            configured_url,
+            connect_timeout=15,
+            sslmode=sslmode,
+            row_factory=dict_row,
+        )
+        adapter = _ConnectionAdapter(connection, is_postgres=True)
+    else:
+        path = database_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path, timeout=15)
+        connection.row_factory = sqlite3.Row
+        adapter = _ConnectionAdapter(connection)
     try:
-        yield connection
+        if configured_url:
+            adapter.execute("SET search_path TO unismartquote")
+            if actor_user_id is not None:
+                adapter.execute(
+                    "SELECT set_config('app.current_user_id', ?, TRUE)",
+                    (str(actor_user_id),),
+                )
+        else:
+            adapter.execute("PRAGMA foreign_keys = ON")
+            adapter.execute("PRAGMA busy_timeout = 15000")
+        yield adapter
         connection.commit()
     except Exception:
         connection.rollback()
@@ -47,8 +98,18 @@ def _connection():
 
 
 def initialize():
-    path_key = str(database_path())
+    configured_url = app_config.database_url()
+    path_key = (
+        "postgres:"
+        + hashlib.sha256(configured_url.encode("utf-8")).hexdigest()
+        if configured_url
+        else str(database_path())
+    )
     if path_key in _INITIALIZED_PATHS:
+        if configured_url:
+            with _connection() as connection:
+                connection.execute("SELECT 1")
+            return
         with _connection() as connection:
             connection.execute(
                 """
@@ -59,6 +120,49 @@ def initialize():
                 )
                 """
             )
+        return
+    if configured_url:
+        with _connection() as connection:
+            for table in ("users", "quotes", "app_settings"):
+                connection.execute(f"SELECT 1 FROM {table} LIMIT 0")
+            role = connection.execute(
+                """
+                SELECT rolsuper, rolbypassrls
+                FROM pg_roles
+                WHERE rolname = CURRENT_USER
+                """
+            ).fetchone()
+            if role is None or role["rolsuper"] or role["rolbypassrls"]:
+                raise RuntimeError(
+                    "Use a dedicated non-superuser database role without "
+                    "BYPASSRLS for the application."
+                )
+            quote_table = connection.execute(
+                """
+                SELECT relrowsecurity, relforcerowsecurity
+                FROM pg_class
+                WHERE oid = 'unismartquote.quotes'::regclass
+                """
+            ).fetchone()
+            policies = connection.execute(
+                """
+                SELECT 1
+                FROM pg_policies
+                WHERE schemaname = 'unismartquote'
+                  AND tablename = 'quotes'
+                  AND policyname = 'quote_owner_isolation'
+                """
+            ).fetchone()
+            if (
+                quote_table is None
+                or not quote_table["relrowsecurity"]
+                or not quote_table["relforcerowsecurity"]
+                or policies is None
+            ):
+                raise RuntimeError(
+                    "Supabase quote row-level security is missing or disabled."
+                )
+        _INITIALIZED_PATHS.add(path_key)
         return
     with _connection() as connection:
         connection.execute("PRAGMA journal_mode = WAL")
@@ -130,6 +234,30 @@ def _public_user(row):
     }
 
 
+def _insert_user(connection, username, display_name, password, role,
+                 must_change_password):
+    salt = secrets.token_bytes(16)
+    password_hash = _hash_password(password, salt)
+    cursor = connection.execute(
+        """
+        INSERT INTO users
+            (username, display_name, password_salt, password_hash,
+             role, must_change_password)
+        VALUES (?, ?, ?, ?, ?, ?)
+        RETURNING id
+        """,
+        (
+            username,
+            display_name,
+            salt,
+            password_hash,
+            role,
+            int(bool(must_change_password)),
+        ),
+    )
+    return cursor.fetchone()["id"]
+
+
 def create_user(username, display_name, password, role="sales",
                 must_change_password=False):
     username = str(username or "").strip()
@@ -144,36 +272,45 @@ def create_user(username, display_name, password, role="sales",
     if role not in ("admin", "sales"):
         raise ValueError("Vai trò tài khoản không hợp lệ.")
 
-    salt = secrets.token_bytes(16)
-    password_hash = _hash_password(password, salt)
     with _connection() as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO users
-                (username, display_name, password_salt, password_hash,
-                 role, must_change_password)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                username,
-                display_name,
-                salt,
-                password_hash,
-                role,
-                int(bool(must_change_password)),
-            ),
+        return _insert_user(
+            connection,
+            username,
+            display_name,
+            password,
+            role,
+            must_change_password,
         )
-        return cursor.lastrowid
 
 
-def create_bootstrap_admin(username, display_name, password):
+def create_bootstrap_admin(
+    username, display_name, password, must_change_password=False
+):
     with _connection() as connection:
+        if connection.is_postgres:
+            connection.execute("SELECT pg_advisory_xact_lock(781934520)")
         admin_exists = connection.execute(
             "SELECT 1 FROM users WHERE role = 'admin' LIMIT 1"
         ).fetchone()
         if admin_exists:
             raise ValueError("Tài khoản quản trị viên đã được khởi tạo.")
-    return create_user(username, display_name, password, role="admin")
+        username = str(username or "").strip()
+        display_name = str(display_name or "").strip()
+        if not USERNAME_PATTERN.fullmatch(username):
+            raise ValueError(
+                "Tên đăng nhập phải có 3–64 ký tự: chữ, số, dấu chấm, gạch "
+                "ngang hoặc gạch dưới."
+            )
+        if not display_name:
+            raise ValueError("Vui lòng nhập tên nhân viên.")
+        return _insert_user(
+            connection,
+            username,
+            display_name,
+            password,
+            "admin",
+            must_change_password=must_change_password,
+        )
 
 
 def has_admin():
@@ -212,7 +349,8 @@ def authenticate(username, password):
     now = time.time()
     with _connection() as connection:
         row = connection.execute(
-            "SELECT * FROM users WHERE username = ?", (username,)
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?)",
+            (username,),
         ).fetchone()
         if row is None:
             dummy_salt = b"ui-quote-login-dummy"
@@ -355,7 +493,7 @@ def set_ollama_model(user_id, model):
 
 def save_quote(owner_id, quote_id, quote_number, customer, payload):
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    with _connection() as connection:
+    with _connection(actor_user_id=owner_id) as connection:
         if quote_id is not None:
             existing = connection.execute(
                 "SELECT id FROM quotes WHERE id = ? AND owner_id = ?",
@@ -388,7 +526,7 @@ def save_quote(owner_id, quote_id, quote_number, customer, payload):
 
 
 def list_quotes(owner_id):
-    with _connection() as connection:
+    with _connection(actor_user_id=owner_id) as connection:
         rows = connection.execute(
             """
             SELECT id, quote_number, customer, updated_at
@@ -402,7 +540,7 @@ def list_quotes(owner_id):
 
 
 def get_quote(owner_id, quote_id):
-    with _connection() as connection:
+    with _connection(actor_user_id=owner_id) as connection:
         row = connection.execute(
             """
             SELECT id, quote_number, customer, updated_at, payload
@@ -419,7 +557,7 @@ def get_quote(owner_id, quote_id):
 
 
 def delete_quote(owner_id, quote_id):
-    with _connection() as connection:
+    with _connection(actor_user_id=owner_id) as connection:
         cursor = connection.execute(
             "DELETE FROM quotes WHERE id = ? AND owner_id = ?",
             (quote_id, owner_id),
@@ -433,7 +571,7 @@ def delete_quotes(owner_id, quote_ids):
         return []
     placeholders = ", ".join("?" for _ in quote_ids)
     parameters = [owner_id, *quote_ids]
-    with _connection() as connection:
+    with _connection(actor_user_id=owner_id) as connection:
         rows = connection.execute(
             f"""
             SELECT id FROM quotes

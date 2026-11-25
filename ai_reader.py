@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlsplit
 import numpy as np
 import pandas as pd
 
@@ -511,6 +512,291 @@ def ask_ollama(text, images, model='qwen2.5vl:3b', base_url='http://127.0.0.1:11
                         "để Sales kiểm tra."
                     )
                     result["warnings"] = warnings
+                    continue
+
+                rate, verified_currency, verified_text = _parse_verified_price(
+                    price_text
+                )
+                fee["rate"] = rate
+                fee["currency"] = verified_currency
+                fee["currency_mark"] = (
+                    "$" if "$" in verified_text else verified_currency or ""
+                )
+                fee["note"] = (
+                    verified_text
+                    if re.search(r"\bat\s+cost\b", verified_text, re.I)
+                    else ""
+                    if note_says_at_cost
+                    else note
+                )
+    return result
+
+
+def _openai_chat_content(messages, model, base_url, api_key, timeout):
+    endpoint = urlsplit(base_url)
+    if (
+        not endpoint.netloc
+        or endpoint.username
+        or endpoint.password
+        or endpoint.query
+        or endpoint.fragment
+        or endpoint.scheme != "https"
+        and not (
+            endpoint.scheme == "http"
+            and endpoint.hostname in ("localhost", "127.0.0.1", "::1")
+        )
+    ):
+        raise ValueError(
+            "AI Cloud endpoint must use HTTPS and must not contain credentials."
+        )
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "response_format": {"type": "json_object"},
+        "messages": messages,
+        "temperature": 0,
+    }
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        opener = urllib.request.build_opener(_NoRedirectHandler)
+        with opener.open(request, timeout=timeout) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code == 429:
+            message = "AI Cloud quota or rate limit reached (HTTP 429)."
+        elif error.code in (401, 403):
+            message = "AI Cloud rejected the request; check API key permissions."
+        else:
+            message = f"AI Cloud request failed (HTTP {error.code})."
+        error.close()
+        raise RuntimeError(message) from None
+    except urllib.error.URLError:
+        raise RuntimeError(
+            "AI Cloud is unavailable; check the endpoint and network connection."
+        ) from None
+
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("AI Cloud returned an unsupported response format.") from None
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("AI Cloud returned empty content.")
+    return content.strip()
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def _parse_ai_json(raw):
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.S)
+        if not match:
+            raise ValueError("AI Cloud did not return valid JSON.") from None
+        try:
+            result = json.loads(match.group())
+        except json.JSONDecodeError:
+            raise ValueError("AI Cloud did not return valid JSON.") from None
+    if not isinstance(result, dict) or not isinstance(result.get("fees"), list):
+        raise ValueError("AI Cloud returned an unsupported data structure.")
+    return result
+
+
+def _verify_openai_fee_row_price(image_data, model, base_url, api_key, timeout):
+    prompt = (
+        "The image contains the buying-price column header followed by exactly "
+        "one fee row from the same pricing table. Read only the price cell in "
+        "that row, under the buying-price column. Return JSON with one key "
+        '"price_text": the exact cell text, including any currency symbol. '
+        "Examples: \"$35\", \"45,000\", \"at cost\". Do not copy a symbol or "
+        "note from another row."
+    )
+    image = base64.b64encode(image_data).decode("ascii")
+    content = _openai_chat_content(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image}"
+                        },
+                    },
+                ],
+            }
+        ],
+        model,
+        base_url,
+        api_key,
+        timeout,
+    )
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError:
+        raise ValueError("AI Cloud returned invalid price verification JSON.") from None
+    price_text = result.get("price_text") if isinstance(result, dict) else None
+    if not isinstance(price_text, str) or not price_text.strip():
+        raise ValueError("AI Cloud could not read the fee price cell.")
+    return price_text.strip()
+
+
+def ask_openai_compatible(
+    text,
+    images,
+    model,
+    base_url,
+    api_key,
+    timeout=180,
+):
+    if not text.strip() and not images:
+        raise ValueError("Tệp không chứa nội dung có thể đọc.")
+    if not model or not base_url or not api_key:
+        raise ValueError(
+            "Configure ai.model, ai.base_url, and ai.api_key in Streamlit Secrets."
+        )
+
+    is_image_extraction = bool(images)
+    expected_image_rows = None
+    fee_row_images = []
+    user_content = []
+    if images:
+        prompt = (
+            "Read every visible fee row from the attached pricing table. "
+            "Match each fee to the buying-price cell on the same row. "
+            "Include zero prices and text values such as at cost. "
+            + (f"\nAdditional source text:\n{text[:50000]}" if text.strip() else "")
+        )
+        user_content.append({"type": "text", "text": prompt})
+        detected_counts = []
+        for image in images:
+            prepared, count, row_images = _prepare_vision_image(image)
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,"
+                        + base64.b64encode(prepared).decode("ascii")
+                    },
+                }
+            )
+            fee_row_images.extend(row_images)
+            if count:
+                detected_counts.append(count)
+        if detected_counts:
+            expected_image_rows = sum(detected_counts)
+            user_content[0]["text"] += (
+                f"\nHorizontal table borders indicate exactly "
+                f"{expected_image_rows} fee rows. Return one item for every "
+                "row, in order."
+            )
+        user_message = {"role": "user", "content": user_content}
+        system = IMAGE_SYSTEM
+    else:
+        system = SYSTEM
+        user_message = {
+            "role": "user",
+            "content": "Extract the following Pricing source:\n" + text[:50000],
+        }
+
+    raw = _openai_chat_content(
+        [
+            {"role": "system", "content": system},
+            user_message,
+        ],
+        model,
+        base_url,
+        api_key,
+        timeout,
+    )
+    result = _parse_ai_json(raw)
+    if is_image_extraction:
+        try:
+            counted_rows = int(result.get("table_row_count"))
+        except (TypeError, ValueError):
+            counted_rows = None
+        warnings = result.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+        if expected_image_rows is not None and len(result["fees"]) != expected_image_rows:
+            warnings.append(
+                f"Ảnh có {expected_image_rows} dòng theo đường kẻ bảng nhưng "
+                f"AI trích xuất {len(result['fees'])}; cần kiểm tra để tránh "
+                "bỏ sót phí."
+            )
+        elif expected_image_rows is None and counted_rows is None:
+            warnings.append(
+                "AI không trả số dòng phí trong ảnh; cần đối chiếu thủ công "
+                "để bảo đảm không bỏ sót."
+            )
+        elif expected_image_rows is None and counted_rows != len(result["fees"]):
+            warnings.append(
+                f"AI đếm được {counted_rows} dòng phí nhưng chỉ trích xuất "
+                f"{len(result['fees'])}; cần kiểm tra lại ảnh trước khi báo giá."
+            )
+        result["warnings"] = warnings
+
+        if (
+            expected_image_rows is not None
+            and len(result["fees"]) == expected_image_rows
+            and len(fee_row_images) == expected_image_rows
+        ):
+            for index, fee in enumerate(result["fees"]):
+                if not isinstance(fee, dict):
+                    continue
+                currency = str(fee.get("currency") or "").upper().strip()
+                note = str(fee.get("note") or "")
+                try:
+                    rate = (
+                        float(fee["rate"])
+                        if fee.get("rate") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    rate = None
+                has_rate = rate is not None and math.isfinite(rate)
+                note_says_at_cost = bool(
+                    re.search(r"\bat\s+cost\b", note, re.I)
+                )
+                needs_verification = (
+                    currency not in ("USD", "US$")
+                    or note_says_at_cost and has_rate
+                    or not has_rate and not note_says_at_cost
+                )
+                if not needs_verification:
+                    continue
+
+                try:
+                    price_text = _verify_openai_fee_row_price(
+                        fee_row_images[index],
+                        model,
+                        base_url,
+                        api_key,
+                        timeout,
+                    )
+                except (RuntimeError, ValueError) as error:
+                    result["warnings"].append(
+                        f"Dòng {index + 1}: {error} Giữ tiền tệ chưa xác định "
+                        "để Sales kiểm tra."
+                    )
                     continue
 
                 rate, verified_currency, verified_text = _parse_verified_price(

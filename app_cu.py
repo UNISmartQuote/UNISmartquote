@@ -4,7 +4,6 @@ from html import escape
 import io
 import json
 import re
-import sqlite3
 import time
 import uuid
 from datetime import date
@@ -28,8 +27,10 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+import app_config
 import security_store
 from ai_reader import (
+    ask_openai_compatible,
     ask_ollama,
     normalize,
     normalize_quote_metadata,
@@ -1110,13 +1111,24 @@ def _show_login():
         )
         if not security_store.has_admin():
             st.error("Máy chủ chưa được khởi tạo tài khoản quản trị.")
-            st.markdown(
-                "Chạy lệnh sau **trên máy chủ** để tạo tài khoản quản trị đầu tiên:"
-            )
-            st.code(
-                '.\\.venv\\Scripts\\python.exe manage_users.py create-admin admin "U&I Admin"',
-                language="powershell",
-            )
+            if app_config.database_url():
+                st.markdown(
+                    "Cấu hình các khóa khởi tạo Admin trong Streamlit Secrets "
+                    "rồi khởi động lại ứng dụng:"
+                )
+                st.code(
+                    "bootstrap_admin.username\n"
+                    "bootstrap_admin.display_name\n"
+                    "bootstrap_admin.password"
+                )
+            else:
+                st.markdown(
+                    "Chạy lệnh sau **trên máy chủ** để tạo tài khoản quản trị đầu tiên:"
+                )
+                st.code(
+                    '.\\.venv\\Scripts\\python.exe manage_users.py create-admin admin "U&I Admin"',
+                    language="powershell",
+                )
             st.caption(
                 "Mật khẩu được nhập kín trong Terminal. Không đặt mật khẩu mặc định "
                 "hoặc chia sẻ tệp cơ sở dữ liệu cho Sales."
@@ -1716,7 +1728,7 @@ def _change_password_form(user):
         else:
             try:
                 security_store.change_password(user["id"], new_password)
-            except ValueError as error:
+            except (ValueError, *security_store.DATABASE_ERRORS) as error:
                 st.error(str(error))
             else:
                 st.session_state["clear_password_inputs"] = True
@@ -1769,7 +1781,11 @@ def _admin_page(user):
                     role="sales",
                     must_change_password=True,
                 )
-            except (ValueError, sqlite3.Error, OSError) as error:
+            except (
+                ValueError,
+                *security_store.DATABASE_ERRORS,
+                OSError,
+            ) as error:
                 st.error(f"Không thể tạo tài khoản: {error}")
             else:
                 st.session_state["clear_password_inputs"] = True
@@ -1858,11 +1874,18 @@ def _admin_page(user):
         with left:
             label = "Khóa tài khoản" if selected_user["active"] else "Mở khóa tài khoản"
             if st.button(label, key="toggle_sales_account"):
-                security_store.set_user_active(
-                    selected_user["id"], not selected_user["active"]
-                )
-                st.success("Đã cập nhật trạng thái tài khoản.")
-                st.rerun()
+                try:
+                    security_store.set_user_active(
+                        selected_user["id"], not selected_user["active"]
+                    )
+                except (
+                    ValueError,
+                    *security_store.DATABASE_ERRORS,
+                ) as error:
+                    st.error(f"Không thể cập nhật tài khoản: {error}")
+                else:
+                    st.success("Đã cập nhật trạng thái tài khoản.")
+                    st.rerun()
         with right:
             with st.form("reset_sales_password"):
                 reset_password = st.text_input(
@@ -1884,7 +1907,10 @@ def _admin_page(user):
                         security_store.reset_user_password(
                             selected_user["id"], reset_password
                         )
-                    except ValueError as error:
+                    except (
+                        ValueError,
+                        *security_store.DATABASE_ERRORS,
+                    ) as error:
                         st.error(str(error))
                     else:
                         st.session_state["clear_password_inputs"] = True
@@ -1967,7 +1993,10 @@ def _sales_account_page(user):
                         security_store.update_display_name(
                             user["id"], display_name
                         )
-                    except (ValueError, sqlite3.Error) as error:
+                    except (
+                        ValueError,
+                        *security_store.DATABASE_ERRORS,
+                    ) as error:
                         st.error(f"Không thể cập nhật thông tin: {error}")
                     else:
                         st.session_state["sales_profile_edit_open"] = False
@@ -2010,41 +2039,65 @@ def _sales_account_page(user):
 
 
 def _admin_settings_page(user):
+    ai_config = app_config.ai_settings()
+    is_cloud_ai = ai_config["provider"] == "openai_compatible"
     _admin_hero(
         "System settings",
         "Cài đặt hệ thống",
-        "Cấu hình mô hình AI và quyền truy cập dành cho máy chủ nội bộ.",
+        (
+            "Cấu hình AI Cloud và quyền truy cập dành cho hệ thống."
+            if is_cloud_ai
+            else "Cấu hình mô hình AI và quyền truy cập dành cho máy chủ nội bộ."
+        ),
     )
     settings_column, model_column = st.columns([1, 1])
     with model_column:
         with st.container(key="admin-model-card", border=True):
+            heading = "AI Cloud" if is_cloud_ai else "Mô hình Ollama"
             st.markdown(
                 '<div class="ui-admin-card-title">'
                 '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">'
                 '<path d="M9 3v3m6-3v3M5 8h14v10H5zM2 12h3m14 0h3M9 21v-3m6 '
                 '3v-3" stroke="currentColor" stroke-width="2" '
-                'stroke-linecap="round"/></svg>Mô hình Ollama</div>',
+                'stroke-linecap="round"/></svg>'
+                f"{heading}</div>",
                 unsafe_allow_html=True,
             )
             st.markdown("---")
-            st.caption(
-                "Cấu hình này áp dụng chung cho chức năng đọc Pricing; "
-                "Sales không thể xem hoặc thay đổi thông số kỹ thuật."
-            )
-            with st.form("ollama_settings_form"):
-                model = st.text_input(
-                    "Tên mô hình Ollama",
-                    value=security_store.get_ollama_model(),
-                    max_chars=128,
+            if is_cloud_ai:
+                st.caption(
+                    "Cấu hình AI Cloud được quản lý trong Streamlit Secrets. "
+                    "Khóa API không hiển thị trong ứng dụng."
                 )
-                submitted = st.form_submit_button("LƯU CẤU HÌNH", type="primary")
-            if submitted:
-                try:
-                    security_store.set_ollama_model(user["id"], model)
-                except (ValueError, PermissionError, sqlite3.Error) as error:
-                    st.error(f"Không thể lưu cấu hình: {error}")
-                else:
-                    st.success("Đã lưu mô hình AI cho toàn hệ thống.")
+                st.info(
+                    "Nhân viên vẫn có thể nhập liệu thủ công nếu AI Cloud "
+                    "không khả dụng."
+                )
+            else:
+                st.caption(
+                    "Cấu hình này áp dụng chung cho chức năng đọc Pricing; "
+                    "Sales không thể xem hoặc thay đổi thông số kỹ thuật."
+                )
+                with st.form("ollama_settings_form"):
+                    model = st.text_input(
+                        "Tên mô hình Ollama",
+                        value=security_store.get_ollama_model(),
+                        max_chars=128,
+                    )
+                    submitted = st.form_submit_button(
+                        "LƯU CẤU HÌNH", type="primary"
+                    )
+                if submitted:
+                    try:
+                        security_store.set_ollama_model(user["id"], model)
+                    except (
+                        ValueError,
+                        PermissionError,
+                        *security_store.DATABASE_ERRORS,
+                    ) as error:
+                        st.error(f"Không thể lưu cấu hình: {error}")
+                    else:
+                        st.success("Đã lưu mô hình AI cho toàn hệ thống.")
     with settings_column:
         with st.container(key="admin-system-card", border=True):
             st.markdown(
@@ -3035,7 +3088,7 @@ def _sales_history_page(user):
         ):
             try:
                 deleted_ids = security_store.delete_quotes(user["id"], pending_ids)
-            except sqlite3.Error as error:
+            except security_store.DATABASE_ERRORS as error:
                 st.error(f"Không thể xóa báo giá: {error}")
             else:
                 if len(deleted_ids) != len(pending_ids):
@@ -3143,31 +3196,74 @@ def _render_quote(user):
             type=["xlsx", "xls", "csv", "pdf", "txt", "png", "jpg", "jpeg", "webp"],
             key="pricing_upload",
         )
+        ai_config = app_config.ai_settings()
+        provider = ai_config["provider"]
+        uploaded_data = uploaded.getvalue() if uploaded is not None else None
+        external_ai_consent = False
         if uploaded is not None:
             st.write(
                 "Tệp đã tải:",
                 uploaded.name,
                 f"· {uploaded.size / 1024:,.1f} KB · Sẵn sàng đọc",
             )
-        model = security_store.get_ollama_model()
-        if st.button("🤖 ĐỌC FILE VÀ TẠO BÁO GIÁ NHÁP", disabled=uploaded is None):
+            if provider == "openai_compatible":
+                st.warning(
+                    "Tệp Pricing sẽ được gửi đến AI Cloud đã cấu hình. "
+                    "Chỉ tiếp tục nếu công ty cho phép chia sẻ dữ liệu này."
+                )
+                upload_fingerprint = hashlib.sha256(uploaded_data).hexdigest()
+                external_ai_consent = st.checkbox(
+                    "Tôi cho phép gửi tệp này tới AI Cloud để trích xuất.",
+                    key=f"external_ai_consent_{upload_fingerprint}",
+                )
+        if provider not in ("ollama", "openai_compatible"):
+            st.error("AI provider trong Secrets chưa được hỗ trợ.")
+        if st.button(
+            "🤖 ĐỌC FILE VÀ TẠO BÁO GIÁ NHÁP",
+            disabled=(
+                uploaded is None
+                or provider not in ("ollama", "openai_compatible")
+                or provider == "openai_compatible" and not external_ai_consent
+            ),
+        ):
             try:
                 source_text, source_images, source_warnings = read_source(
-                    uploaded.name, uploaded.getvalue()
+                    uploaded.name, uploaded_data
                 )
-                if source_images and not any(
-                    token in model.lower()
-                    for token in ("vl", "vision", "llava", "gemma3")
-                ):
-                    st.error(
-                        "Tệp ảnh/PDF scan cần mô hình thị giác, ví dụ "
-                        "qwen2.5vl:3b."
-                    )
-                else:
-                    with st.spinner("Ollama đang đọc bảng giá trên máy chủ..."):
-                        result = ask_ollama(
-                            source_text, source_images, model=model.strip()
+                if provider == "ollama":
+                    model = security_store.get_ollama_model()
+                    if source_images and not any(
+                        token in model.lower()
+                        for token in ("vl", "vision", "llava", "gemma3")
+                    ):
+                        st.error(
+                            "Tệp ảnh/PDF scan cần mô hình thị giác, ví dụ "
+                            "qwen2.5vl:3b."
                         )
+                        result = None
+                    else:
+                        with st.spinner(
+                            "Ollama đang đọc bảng giá trên máy chủ..."
+                        ):
+                            result = ask_ollama(
+                                source_text,
+                                source_images,
+                                model=model.strip(),
+                                base_url=(
+                                    ai_config["base_url"]
+                                    or "http://127.0.0.1:11434"
+                                ),
+                            )
+                else:
+                    with st.spinner("AI Cloud đang đọc bảng giá..."):
+                        result = ask_openai_compatible(
+                            source_text,
+                            source_images,
+                            model=ai_config["model"],
+                            base_url=ai_config["base_url"],
+                            api_key=ai_config["api_key"],
+                        )
+                if result is not None:
                     candidate, warnings = normalize(result)
                     if candidate.empty:
                         raise ValueError(
@@ -3191,7 +3287,7 @@ def _render_quote(user):
                 OSError,
                 RuntimeError,
                 ValueError,
-                sqlite3.Error,
+                *security_store.DATABASE_ERRORS,
             ) as error:
                 st.error(f"Không thể đọc bảng giá: {error}")
 
@@ -3656,7 +3752,11 @@ def _render_quote(user):
                         st.session_state["quote_customer"].strip(),
                         payload,
                     )
-                except (ValueError, sqlite3.Error, OSError) as error:
+                except (
+                    ValueError,
+                    *security_store.DATABASE_ERRORS,
+                    OSError,
+                ) as error:
                     st.error(f"Không thể lưu báo giá: {error}")
                 else:
                     st.session_state["current_quote_id"] = saved_id
@@ -3742,8 +3842,30 @@ def _render_quote(user):
                     "PDF không chứa giá mua, Profit nội bộ hoặc Commission."
                 )
 
+def _bootstrap_admin_from_secrets():
+    if security_store.has_admin():
+        return
+    credentials = app_config.bootstrap_admin()
+    if credentials is None:
+        return
+    security_store.create_bootstrap_admin(
+        credentials["username"],
+        credentials["display_name"],
+        credentials["password"],
+        must_change_password=True,
+    )
+
+
 def main():
-    security_store.initialize()
+    try:
+        security_store.initialize()
+        _bootstrap_admin_from_secrets()
+    except (ValueError, RuntimeError, *security_store.DATABASE_ERRORS):
+        st.error(
+            "Không thể khởi tạo cơ sở dữ liệu hoặc tài khoản quản trị. "
+            "Hãy kiểm tra cấu hình triển khai và quyền kết nối."
+        )
+        st.stop()
     apply_styles()
     if not secure_transport():
         st.error(

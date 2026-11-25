@@ -2,21 +2,27 @@ import base64
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from contextlib import closing
+from unittest.mock import Mock, patch
+from pathlib import Path
 
 import pandas as pd
 from PIL import Image, ImageDraw
 
+import ai_reader
 from ai_reader import (
+    ask_openai_compatible,
     ask_ollama,
     normalize,
     normalize_quote_metadata,
     validate_candidate,
 )
+import migrate_sqlite_to_postgres
 import security_store
 from pricing_logic import (
     allocate_profit_by_cost,
@@ -26,6 +32,130 @@ from pricing_logic import (
 
 
 class AIReaderTests(unittest.TestCase):
+    def test_openai_compatible_request_uses_secrets_and_parses_json(self):
+        requests = []
+        response_body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "direction": "export",
+                                "fees": [{"name": "Ocean Freight", "rate": 300}],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            requests.append((request, timeout))
+            return io.BytesIO(json.dumps(response_body).encode("utf-8"))
+
+        fake_opener = Mock()
+        fake_opener.open.side_effect = fake_urlopen
+        with patch(
+            "ai_reader.urllib.request.build_opener",
+            return_value=fake_opener,
+        ) as build_opener:
+            result = ask_openai_compatible(
+                "Pricing text",
+                [],
+                model="vision-model",
+                base_url="https://ai.example.test/v1/",
+                api_key="not-a-real-test-key",
+            )
+
+        self.assertTrue(
+            any(
+                handler is ai_reader._NoRedirectHandler
+                for handler in build_opener.call_args.args
+            )
+        )
+        request, timeout = requests[0]
+        payload = json.loads(request.data)
+        self.assertEqual(
+            request.full_url,
+            "https://ai.example.test/v1/chat/completions",
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer not-a-real-test-key")
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["model"], "vision-model")
+        self.assertEqual(timeout, 180)
+        self.assertEqual(result["fees"][0]["rate"], 300)
+
+    def test_openai_compatible_failure_does_not_expose_api_key(self):
+        from urllib.error import HTTPError
+
+        api_key = "not-a-real-test-key"
+        error = HTTPError(
+            "https://ai.example.test/v1/chat/completions",
+            429,
+            "rate limited",
+            {},
+            io.BytesIO(b""),
+        )
+        fake_opener = Mock()
+        fake_opener.open.side_effect = error
+        with patch(
+            "ai_reader.urllib.request.build_opener",
+            return_value=fake_opener,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                ask_openai_compatible(
+                    "Pricing text",
+                    [],
+                    model="vision-model",
+                    base_url="https://ai.example.test/v1",
+                    api_key=api_key,
+                )
+
+        self.assertIn("429", str(raised.exception))
+        self.assertNotIn(api_key, str(raised.exception))
+        self.assertTrue(error.fp.closed)
+
+    def test_openai_compatible_image_request_uses_inline_png(self):
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (20, 20), "white").save(image_buffer, format="PNG")
+        requests = []
+        response_body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {"table_row_count": 0, "warnings": [], "fees": []}
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            requests.append(json.loads(request.data))
+            return io.BytesIO(json.dumps(response_body).encode("utf-8"))
+
+        fake_opener = Mock()
+        fake_opener.open.side_effect = fake_urlopen
+        with patch(
+            "ai_reader.urllib.request.build_opener",
+            return_value=fake_opener,
+        ):
+            result = ask_openai_compatible(
+                "",
+                [image_buffer.getvalue()],
+                model="vision-model",
+                base_url="https://ai.example.test/v1",
+                api_key="not-a-real-test-key",
+            )
+
+        content = requests[0]["messages"][1]["content"]
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertTrue(
+            content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        )
+        self.assertEqual(result["fees"], [])
+
     def test_quote_metadata_only_uses_explicit_source_values(self):
         fields, warnings = normalize_quote_metadata(
             {
@@ -397,6 +527,106 @@ with fitz.open(stream=pdf_data, filetype="pdf") as pdf:
                 self.assertEqual(
                     saved["payload"]["fees"][0]["Giá bán (USD)"], 430
                 )
+        finally:
+            if previous_db_path is None:
+                os.environ.pop("UI_QUOTE_DB_PATH", None)
+            else:
+                os.environ["UI_QUOTE_DB_PATH"] = previous_db_path
+
+
+    def test_cloud_ai_requires_consent_before_calling_provider(self):
+        from streamlit.testing.v1 import AppTest
+
+        previous_db_path = os.environ.get("UI_QUOTE_DB_PATH")
+        sample_result = {
+            "direction": "export",
+            "pol": "HCM",
+            "pod": "Incheon",
+            "incoterm": "FOB",
+            "valid_until": "2026-12-01",
+            "container_type": "20GP",
+            "container_quantity": 1,
+            "fees": [
+                {
+                    "name": "Ocean Freight",
+                    "rate": 300,
+                    "unit": "CONT",
+                    "quantity": 1,
+                    "currency": "USD",
+                    "group": "OCEAN FREIGHT",
+                }
+            ],
+        }
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                os.environ["UI_QUOTE_DB_PATH"] = os.path.join(
+                    temp_dir, "quotes.sqlite3"
+                )
+                security_store.initialize()
+                user_id = security_store.create_user(
+                    "cloudsales",
+                    "Cloud Sales Test",
+                    "Cloud-sales-test-123",
+                    role="sales",
+                )
+                app_path = os.path.join(
+                    os.path.dirname(__file__), "app_cu.py"
+                )
+                with (
+                    patch(
+                        "app_config.ai_settings",
+                        return_value={
+                            "provider": "openai_compatible",
+                            "base_url": "https://ai.example.test/v1",
+                            "model": "vision-model",
+                            "api_key": "not-a-real-test-key",
+                        },
+                    ),
+                    patch(
+                        "ai_reader.read_source",
+                        return_value=("pricing", [], []),
+                    ),
+                    patch(
+                        "ai_reader.ask_openai_compatible",
+                        return_value=sample_result,
+                    ) as ask_ai,
+                ):
+                    app = AppTest.from_file(app_path)
+                    app.session_state["auth_user_id"] = user_id
+                    app.session_state["sales_navigation"] = "quotes"
+                    app.run(timeout=15)
+                    app.file_uploader[0].upload(
+                        "pricing.txt", b"pricing", "text/plain"
+                    )
+                    app.run(timeout=15)
+
+                    button = next(
+                        button
+                        for button in app.button
+                        if button.label
+                        == "🤖 ĐỌC FILE VÀ TẠO BÁO GIÁ NHÁP"
+                    )
+                    self.assertTrue(button.disabled)
+                    self.assertEqual(ask_ai.call_count, 0)
+                    consent = next(
+                        checkbox
+                        for checkbox in app.checkbox
+                        if checkbox.label
+                        == "Tôi cho phép gửi tệp này tới AI Cloud để trích xuất."
+                    )
+                    app.session_state[consent.key] = True
+                    app.run(timeout=15)
+                    next(
+                        button
+                        for button in app.button
+                        if button.label
+                        == "🤖 ĐỌC FILE VÀ TẠO BÁO GIÁ NHÁP"
+                    ).click()
+                    app.run(timeout=15)
+
+                self.assertEqual(list(app.exception), [])
+                self.assertEqual(ask_ai.call_count, 1)
+                self.assertEqual(len(security_store.list_quotes(user_id)), 1)
         finally:
             if previous_db_path is None:
                 os.environ.pop("UI_QUOTE_DB_PATH", None)
@@ -902,6 +1132,152 @@ class SecurityStoreTests(unittest.TestCase):
         )
         self.assertEqual(security_store.list_quotes(self.alice_id), [])
         self.assertEqual(len(security_store.list_quotes(self.bob_id)), 1)
+
+
+class PostgreSQLConnectionTests(unittest.TestCase):
+    def test_postgres_connection_sets_schema_owner_context_and_ssl(self):
+        class FakeConnection:
+            def __init__(self):
+                self.calls = []
+                self.committed = False
+                self.closed = False
+
+            def execute(self, query, parameters=()):
+                self.calls.append((query, parameters))
+
+            def commit(self):
+                self.committed = True
+
+            def rollback(self):
+                raise AssertionError("Unexpected transaction rollback.")
+
+            def close(self):
+                self.closed = True
+
+        fake_connection = FakeConnection()
+        with (
+            patch(
+                "security_store.app_config.database_url",
+                return_value=(
+                    "postgresql://app@db.example.test/quotes?sslmode=verify-full"
+                ),
+            ),
+            patch(
+                "security_store.psycopg.connect",
+                return_value=fake_connection,
+            ) as connect,
+        ):
+            with security_store._connection(actor_user_id=42) as connection:
+                connection.execute(
+                    "SELECT id FROM quotes WHERE owner_id = ?", (42,)
+                )
+
+        self.assertEqual(connect.call_args.kwargs["sslmode"], "verify-full")
+        self.assertTrue(
+            any(
+                query == "SELECT set_config('app.current_user_id', %s, TRUE)"
+                and parameters == ("42",)
+                for query, parameters in fake_connection.calls
+            )
+        )
+        self.assertTrue(
+            any(
+                query == "SELECT id FROM quotes WHERE owner_id = %s"
+                and parameters == (42,)
+                for query, parameters in fake_connection.calls
+            )
+        )
+        self.assertTrue(fake_connection.committed)
+        self.assertTrue(fake_connection.closed)
+
+
+class SQLiteMigrationTests(unittest.TestCase):
+    def _create_source(self, path, usernames=("alice",)):
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    password_salt BLOB NOT NULL,
+                    password_hash BLOB NOT NULL,
+                    role TEXT NOT NULL,
+                    active INTEGER NOT NULL,
+                    must_change_password INTEGER NOT NULL,
+                    failed_attempts INTEGER NOT NULL,
+                    locked_until REAL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE quotes (
+                    id TEXT PRIMARY KEY,
+                    owner_id INTEGER NOT NULL,
+                    quote_number TEXT NOT NULL,
+                    customer TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            for index, username in enumerate(usernames, start=1):
+                connection.execute(
+                    """
+                    INSERT INTO users
+                        (id, username, display_name, password_salt,
+                         password_hash, role, active, must_change_password,
+                         failed_attempts, locked_until, created_at)
+                    VALUES (?, ?, ?, ?, ?, 'sales', 1, 0, 0, NULL, ?)
+                    """,
+                    (
+                        index,
+                        username,
+                        "Sample Sales",
+                        b"sample-salt",
+                        b"sample-hash",
+                        "2026-01-01 00:00:00",
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO quotes
+                    (id, owner_id, quote_number, customer, updated_at, payload)
+                VALUES ('sample-quote', 1, 'Q-SAMPLE', 'Sample customer',
+                        '2026-01-01 00:00:00', '{}')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES ('ollama_model', 'sample-model', '2026-01-01 00:00:00')
+                """
+            )
+
+    def test_dry_run_counts_only_fake_source_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "sample.sqlite3"
+            self._create_source(source)
+
+            counts = migrate_sqlite_to_postgres.inspect_source(source)
+
+        self.assertEqual(
+            counts,
+            {"users": 1, "quotes": 1, "app_settings": 1},
+        )
+
+    def test_dry_run_rejects_case_insensitive_duplicate_usernames(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "sample.sqlite3"
+            self._create_source(source, usernames=("alice", "ALICE"))
+
+            with self.assertRaisesRegex(
+                ValueError, "duplicate case-insensitive usernames"
+            ):
+                migrate_sqlite_to_postgres.inspect_source(source)
 
 
 class PricingTests(unittest.TestCase):
