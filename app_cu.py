@@ -3860,7 +3860,7 @@ def main():
     try:
         security_store.initialize()
         _bootstrap_admin_from_secrets()
-        except (ValueError, RuntimeError, *security_store.DATABASE_ERRORS) as e:
+    except (ValueError, RuntimeError, *security_store.DATABASE_ERRORS) as e:
         st.error(
             "Không thể khởi tạo cơ sở dữ liệu hoặc tài khoản quản trị. "
             "Hãy kiểm tra cấu hình triển khai và quyền kết nối."
