@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="320" viewBox="0 0 1360 320" fill="none">
+  <defs>
+    <linearGradient id="sea" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#DDEEFF"/>
+      <stop offset="1" stop-color="#B9DDF6"/>
+    </linearGradient>
+    <linearGradient id="ship" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#2788C8"/>
+      <stop offset="1" stop-color="#075B9C"/>
+    </linearGradient>
+    <linearGradient id="container" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#1488C9"/>
+      <stop offset="1" stop-color="#08649F"/>
+    </linearGradient>
+  </defs>
+  <g opacity=".22" stroke="#1684C1" stroke-width="2">
+    <path d="M715 52c26-20 58-25 85-16l16 16-10 15-27 4-10 18-25 1-13 22-26-5-8-19-24-9z"/>
+    <path d="M836 150c20-17 46-20 66-12l10 18-12 17-5 30-17 16-12-22-20-7z"/>
+    <path d="M1062 50c25-18 60-19 79-2l-4 18-20 10-13 17-22-4-10 16-26-3-7-23z"/>
+    <path d="M1196 131c22-14 46-13 58 2l-6 15-19 9-5 25-18 13-9-21-19-9z"/>
+    <circle cx="1055" cy="142" r="115"/>
+    <ellipse cx="1055" cy="142" rx="54" ry="115"/>
+    <path d="M941 142h228M955 97c61 26 137 26 200 0M955 187c61-26 137-26 200 0"/>
+  </g>
+  <g opacity=".45" stroke="#1582C3" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M715 208h212M743 208V80h12v128M749 80h112M760 89l90 89M854 89l-89 89M740 113h120M740 143h120M740 173h120"/>
+    <path d="M805 208V95h12v113M811 95h112M823 104l90 90M915 104l-89 90M802 127h120M802 157h120M802 187h120"/>
+  </g>
+  <g transform="translate(900 177)">
+    <path d="M10 62h340l-40 38H51z" fill="#075B9C"/>
+    <path d="M27 58h281v11H27z" fill="#54A5D5"/>
+    <path d="M44 21h49v37H44zM98 21h49v37H98zM152 21h49v37h-49zM206 21h49v37h-49zM260 21h40v37h-40z" fill="url(#container)"/>
+    <path d="M44 0h49v18H44zM98 0h49v18H98zM152 0h49v18h-49zM206 0h49v18h-49zM260 0h40v18h-40z" fill="#32A0D4"/>
+    <path d="M45 31v21M99 31v21M153 31v21M207 31v21M261 31v21" stroke="#9ACCE9" stroke-width="2" opacity=".7"/>
+    <path d="M8 105c70 12 253 12 342 0M38 116c80 11 211 11 288 0" stroke="#4DA1D0" stroke-width="3" stroke-linecap="round" opacity=".65"/>
+  </g>
+  <g transform="translate(1078 50) rotate(-8)">
+    <path d="M3 31 79 21 112 0l11 2-17 20 57 4 22-10 9 2-16 17 10 7-3 6-16-3-17 19-9-1 6-20-54-7-22 28-10-1 13-31-73 7z" fill="#fff" stroke="#2788C8" stroke-width="2"/>
+  </g>
+  <path d="M694 274c111-25 205-22 303-6 94 15 190 17 363-11" stroke="#68B4E2" stroke-width="3" opacity=".35"/>
+  <path d="M696 295c123-22 226-17 326 0 104 18 204 14 330-12" stroke="#68B4E2" stroke-width="2" opacity=".28"/>
+</svg>
